@@ -1,0 +1,128 @@
+---
+title: "Go_Term_Analysis_Monarch"
+output: html_document
+date: "2026-11-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+First, Install goseq:
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install("goseq")
+
+library(goseq)
+```
+Load your 3 raw files. You will need to download your gene list from Galaxy and then upload here into R as you did with the RNA-seq project. Be sure that the names of files below match the names of your files exactly. 
+
+```{r}
+cand_genes <- unique(readLines("candidate_genes.txt")) # 1 gene ID per line
+gff <- read.delim("GCF_018135715.1_MEX_DaPlex_genomic.gff.gz", comment.char = "#", header = FALSE)
+gaf <- read.delim("GCF_018135715.1-RS_2023_11_gene_ontology.gaf.gz", comment.char = "!", header = FALSE)
+```
+
+
+Next, for background calculations we need to extract all genome genes & calculate lengths (End-Start + 1) from GFF3
+
+```{r}
+genes_gff <- gff[gff$V3 == "gene", ]
+gene_ids <- sub(".*ID=([^;]+).*", "\\1", genes_gff$V9) # pulls 'gene-LOC11677...'
+gene_lengths <- genes_gff$V5 - genes_gff$V4 + 1
+names(gene_lengths) <- gene_ids
+gene_lengths <- gene_lengths[!duplicated(names(gene_lengths))]
+```
+
+goseq needs a binary vector of 1/0 if the gene is found in your candidate gene list or not. This line builds that file. After building the file it will tell you how many of the candidate genes was found in your genome file (should be most of them -- it is ok if it is not all of them!)
+
+```{r}
+cand_genes <- cand_genes[!grepl("exon-", cand_genes)]
+cand_genes <- unique(ifelse(grepl("^gene-", cand_genes), cand_genes, paste0("gene-", cand_genes)))
+
+gene_vector <- as.integer(names(gene_lengths) %in% cand_genes)
+names(gene_vector) <- names(gene_lengths)
+cat("Matched candidate genes in genome:", sum(gene_vector), "out of", length(cand_genes), "\n")
+```
+
+Build the Gene-to-GO mapping table (prepend 'gene-' to GAF Column 3 to match GFF3 IDs)
+
+```{r}
+gene2go <- unique(data.frame(
+  gene = paste0("gene-", gaf$V3),
+  go   = gaf$V5,
+  stringsAsFactors = FALSE
+))
+
+```
+
+Now run goseq with gene-length bias correction. (Why do you think this length correction would be necessary?)
+
+```{r}
+pwf <- nullp(gene_vector, bias.data = gene_lengths)
+go_results <- goseq(pwf, gene2cat = gene2go)
+```
+
+Interpreting the results:
+Before testing for Gene Ontology (GO) enrichment, `goseq` fits a **Probability Weighting Function (PWF)** using `nullp()` to account for **gene-length bias** in variant detection.
+
+* **X-axis (`Biased Data in 1500 gene bins`):** All annotated *Danaus plexippus* genes sorted by length (in base pairs) and grouped into bins of 1,500 genes[cite: 5].
+* **Y-axis (`Proportion DE`):** The proportion of genes in each length bin carrying at least one `HIGH` or `MODERATE` impact variant[cite: 5]. *(Note: The axis is labeled "DE" for "Differentially Expressed" because `goseq` was originally designed for RNA-seq, though here it represents variant-containing candidate genes.)*
+* **Open Circles & Green Curve:** Each circle shows the observed proportion of mutated genes in a 1,500-gene bin, and the green spline curve models how the baseline probability of containing a variant changes with gene length[cite: 5].
+
+**Why this matters:** The sharp upward slope at shorter lengths (~17% in the shortest bin rising to ~70% for genes >10 kb) demonstrates strong length bias—longer genes provide a larger mutational target and are more likely to accumulate variants by chance. By incorporating this green weighting curve into the downstream enrichment test, `goseq` prevents biological processes composed of unusually large genes from appearing falsely enriched solely due to gene size.
+
+7. Adjust p-values for multiple testing (FDR) and save results (recall: where did we see this same kind of correction in RNA-seq?)
+```{r}
+go_results$padj <- p.adjust(go_results$over_represented_pvalue, method = "BH")
+write.csv(go_results, "monarch_goseq_results.csv", row.names = FALSE)
+```
+
+Preview the results!
+```{r}
+head(go_results, 15)
+```
+
+Now take a look at these results - you can see the enriched GO terms and use that sheet to make graphs and follow-up on interesting candidates.
+
+
+If you want here is a more extensive R script to then take your GO term results and figure out the exact genes that have candidate SNPs contributing to that GO term. It will generate an updated go results with the contributing genes so you could look them up and learn more!
+```{r}
+# 1. Keep only Gene-to-GO pairs where the gene is in your candidate gene list
+cand_gene2go <- gene2go[gene2go$gene %in% cand_genes, ]
+
+# 2. (Optional) Pull readable gene descriptions from GFF3 Column 9 so you know what each LOC gene does
+gff_desc <- sub(".*description=([^;]+).*", "\\1", genes_gff$V9)
+gff_desc[!grepl("description=", genes_gff$V9)] <- ""
+gff_desc <- URLdecode(gff_desc) # converts '%2C' etc. into readable punctuation
+names(gff_desc) <- gene_ids
+gff_desc <- gff_desc[!duplicated(names(gff_desc))]
+
+# Helper function to format as "gene-LOC1167... (gene description)"
+format_gene <- function(g) {
+  d <- gff_desc[g]
+  ifelse(!is.na(d) & d != "", paste0(g, " (", d, ")"), g)
+}
+
+# 3. Collapse all contributing candidate genes per GO category into a single column
+genes_per_go <- tapply(
+  cand_gene2go$gene,
+  cand_gene2go$go,
+  function(g) paste(format_gene(sort(unique(g))), collapse = "; ")
+)
+
+# 4. Attach to your goseq results table and save
+go_results$contributing_genes <- genes_per_go[go_results$category]
+write.csv(go_results, "monarch_goseq_results_with_genes.csv", row.names = FALSE)
+
+# Inspect the top enriched GO terms along with their specific candidate genes
+head(go_results[, c("category", "term", "numDEInCat", "numInCat", "padj", "contributing_genes")], 10)
+```
+
